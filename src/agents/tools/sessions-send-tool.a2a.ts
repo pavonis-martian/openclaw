@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
 import type { SessionDeliveryGeneration } from "../../config/sessions/session-delivery-generation.types.js";
 import { bindInProcessSessionDeliveryGeneration } from "../../gateway/in-process-session-delivery.js";
 import { formatErrorMessage } from "../../infra/errors.js";
@@ -105,6 +106,7 @@ export async function runSessionsSendA2AFlow(params: {
   announceTimeoutMs: number;
   maxPingPongTurns: number;
   replyMode?: "peer" | "one-way";
+  wakeOnReply?: boolean;
   requesterSessionKey?: string;
   requesterAgentId?: string;
   requesterSession?: AgentStepSession;
@@ -149,14 +151,20 @@ export async function runSessionsSendA2AFlow(params: {
           params.requesterSessionKey &&
           isDeliveryFailureWait(wait)
         ) {
-          const error =
-            typeof wait.error === "string" && wait.error.trim() ? `: ${wait.error.trim()}` : "";
+          const errorText =
+            params.wakeOnReply && wait.error
+              ? truncateWithMarker(wait.error, 2048, { marker: "…", reserve: 1, trimEnd: true })
+              : wait.error;
+          const error = errorText?.trim() ? `: ${errorText.trim()}` : "";
+          const displayKey = params.wakeOnReply
+            ? truncateWithMarker(params.displayKey, 256, { marker: "…", reserve: 1, trimEnd: true })
+            : params.displayKey;
           await runAgentStep({
             ...requesterStepContext,
             sessionKey: params.requesterSessionKey,
             message: wait.sourceReplyDelivered
-              ? `sessions_send target run for ${params.displayKey} failed${error}. The target's final reply was already delivered to its source conversation. Do not resend; report the run failure.`
-              : `sessions_send delivery to ${params.displayKey} failed${error}. The target may not have received the message; retry or report the failure instead of assuming delivery succeeded.`,
+              ? `sessions_send target run for ${displayKey} failed${error}. The target's final reply was already delivered to its source conversation. Do not resend; report the run failure.`
+              : `sessions_send delivery to ${displayKey} failed${error}. The target may not have received the message; retry or report the failure instead of assuming delivery succeeded.`,
             extraSystemPrompt: wait.sourceReplyDelivered
               ? "The target run failed after its final source reply was delivered. Preserve the run error diagnosis. Do not resend the message or the reply."
               : "A previous sessions_send delivery failed after it was accepted. Inspect the accepted operation before retrying, or report the failure. Preserve attributed session-tool delivery; do not replace it with an operator CLI request. Do not assume the target received the message.",
@@ -201,14 +209,14 @@ export async function runSessionsSendA2AFlow(params: {
     if (sameSessionSourceReply && sourceReplyDelivered) {
       return;
     }
-    // Control UI sessions are human-facing conversations, not autonomous peers.
+    // Explicit wakes and Control UI requesters receive one result, not a peer exchange.
     // Deliver the target result to the requester once, but do not feed the
     // requester's human-facing response back into the target session. Preserve
     // any still-owed announcement to a target's external channel below.
     const oneWayInternalRequesterSessionKey =
       params.requesterSessionKey &&
       !sameSessionSourceReply &&
-      isInternalMessageChannel(params.requesterChannel)
+      (params.wakeOnReply || isInternalMessageChannel(params.requesterChannel))
         ? params.requesterSessionKey
         : undefined;
     if (oneWayInternalRequesterSessionKey) {
@@ -220,7 +228,7 @@ export async function runSessionsSendA2AFlow(params: {
         sourceAgentId: params.targetAgentId,
         sourceTool: "sessions_send",
       });
-      if (sourceReplyDelivered) {
+      if (params.wakeOnReply || sourceReplyDelivered) {
         return;
       }
     }

@@ -168,8 +168,18 @@ Sessions keep their addresses when execution moves between the Gateway, a paired
 During healthy worker provisioning or workspace preparation, accepted input stays queued until the intended worker is ready. It starts once after OpenClaw rechecks the session and placement. Cancellation, failed setup, or a replaced destination does not silently run that input locally or on another worker. Check the retained input and setup error before submitting another message.
 
 - **Fire-and-forget:** set `timeoutSeconds: 0` to enqueue and return immediately.
+- **Wake on reply:** set `wakeOnReply: true` to return immediately, then wake the original requester once with the result. This overrides `timeoutSeconds` and skips peer ping-pong and target-channel announcements. Omit `mode` or use `mode: "followup"`.
 - **Wait for reply:** set a timeout and get the response inline.
 - **Continue a paused child task:** send the continuation without `mode`. When the caller controls a native child paused by `sessions_yield` with task-owned completion, the runtime resumes that task automatically, preserving its identity and original completion recipient. Use `mode: "resume"` to require this behavior explicitly. An explicit `mode: "followup"` starts a separate turn and leaves the paused task intact.
+
+Wake-on-reply is best effort and process-local. A Gateway restart may lose the
+pending wake; there is no restart replay. Empty or silent replies do not wake
+the requester. Terminal failures use the existing requester failure notification.
+The continuation keeps the original requester session and captured delivery route;
+it does not redirect to a replacement session or a later stored address.
+Self-wakes, task/cron requesters, and exact-session access grants are not supported.
+Native task resume and ACP background tasks keep their existing completion owner
+and do not add a second wake. Omitting `wakeOnReply` leaves ordinary behavior unchanged.
 
 A separate follow-up to your native child starts only after Gateway admission
 and input preparation. If admission rejects the turn, the send returns an error

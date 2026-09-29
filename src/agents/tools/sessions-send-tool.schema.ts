@@ -8,6 +8,12 @@ export const SessionsSendToolSchema = Type.Object({
   message: Type.String(),
   timeoutSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   watch: Type.Optional(Type.Boolean()),
+  wakeOnReply: Type.Optional(
+    Type.Boolean({
+      description:
+        "Return immediately and wake this session once with the reply, without ping-pong or target announcement. Best effort; lost on Gateway restart.",
+    }),
+  ),
   mode: Type.Optional(
     Type.Union([
       Type.Literal("notify"),

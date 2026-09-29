@@ -1,5 +1,6 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { agentCommandFromIngress } from "../../commands/agent.js";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -40,6 +41,12 @@ vi.mock("./sessions-send-tool.a2a.js", () => ({
   runSessionsSendA2AFlow: vi.fn(async () => {}),
 }));
 
+vi.mock("../../commands/agent.js", () => ({
+  agentCommandFromIngress: vi.fn(async () => {
+    throw new Error("Unexpected target announcement");
+  }),
+}));
+
 const requesterSessionKey = "agent:main:main";
 const targetSessionKey = "agent:main:dashboard:admission-target";
 const runId = "sessions-send-admission-run";
@@ -74,6 +81,7 @@ describe("sessions_send dispatch admission", () => {
     setActivePluginRegistry(createSessionConversationTestRegistry());
     resetGatewayWorkAdmission();
     vi.mocked(runSessionsSendA2AFlow).mockClear();
+    vi.mocked(agentCommandFromIngress).mockClear();
     registerWatch = vi.spyOn(sessionStateEvents, "registerSessionStateWatch");
     for (const [sessionKey, sessionId] of [
       [requesterSessionKey, "requester-session"],
@@ -312,6 +320,180 @@ describe("sessions_send dispatch admission", () => {
         prepareFollowup.mockRestore();
         gateway.mockRestore();
       }
+    },
+  );
+
+  it.each(["notify", "steer", "resume", "self", "missing requester", "child", "cron", "scoped"])(
+    "rejects unsupported best-effort wake (%s) before dispatch",
+    async (kind) => {
+      const invalidMode = ["notify", "steer", "resume"].includes(kind);
+      const sourceKey =
+        kind === "child"
+          ? "agent:main:subagent:wake-requester"
+          : kind === "cron"
+            ? "agent:main:cron:wake-job:run:turn"
+            : requesterSessionKey;
+      if (sourceKey !== requesterSessionKey) {
+        await replaceSessionEntry(
+          { agentId: "main", sessionKey: sourceKey },
+          {
+            sessionId: "task-requester",
+            updatedAt: 1,
+            ...(kind === "child" ? { spawnedBy: requesterSessionKey } : {}),
+          },
+        );
+      }
+      const targetKey = kind === "self" ? sourceKey : targetSessionKey;
+      const callGateway = vi.fn();
+      callGateway.mockImplementation(
+        async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+          if (request.method === "sessions.resolve") return { key: targetKey, agentId: "main" };
+          if (request.method === "sessions.list")
+            return { sessions: [{ key: targetKey, agentId: "main", kind: "direct" }] };
+          throw new Error(`Unexpected Gateway method: ${request.method}`);
+        },
+      );
+      const tool = createSessionsSendTool({
+        agentSessionKey: kind === "missing requester" ? undefined : sourceKey,
+        config,
+        callGateway,
+        ...(kind === "scoped" ? { expectedTargetSessionId: "target-session" } : {}),
+      });
+      const execution = tool.execute("invalid-wake", {
+        sessionKey: targetKey,
+        message: "Do not dispatch",
+        wakeOnReply: true,
+        ...(invalidMode ? { mode: kind } : {}),
+      });
+      if (invalidMode) {
+        await expect(execution).rejects.toThrow("wakeOnReply requires a new turn");
+      } else {
+        expect((await execution).details).toMatchObject({
+          status: "error",
+          error: expect.stringContaining(
+            kind === "scoped" ? "access grant" : "wakeOnReply requires",
+          ),
+        });
+      }
+      expect(callGateway.mock.calls.some(([request]) => request.method === "agent")).toBe(false);
+      expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["reply", "error", "empty"] as const)(
+    "wakes only the original requester after a best-effort %s",
+    async (outcome) => {
+      const sourceKey = "agent:main:telegram:direct:original-requester";
+      await replaceSessionEntry(
+        { agentId: "main", sessionKey: sourceKey },
+        { sessionId: "original-session", updatedAt: 1, lifecycleRevision: "original-generation" },
+      );
+      const settled = await trackActualReplyFlow();
+      const targetResult = createDeferredCore<Record<string, unknown>>();
+      const continuations: Record<string, unknown>[] = [];
+      const callGateway = vi.fn();
+      callGateway.mockImplementation(
+        async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+          if (request.method === "sessions.resolve") {
+            return { key: targetSessionKey, agentId: "main" };
+          }
+          if (request.method === "sessions.list") {
+            return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
+          }
+          if (request.method === "agent.wait") {
+            return isRecord(request.params) && request.params.runId === runId
+              ? targetResult.promise
+              : { status: "ok", terminalReply: { disposition: "empty" } };
+          }
+          if (request.method === "agent" && isRecord(request.params)) {
+            if (request.params.sessionKey === targetSessionKey) {
+              return { runId, status: "accepted" };
+            }
+            continuations.push(request.params);
+            return { runId: "requester-continuation", status: "accepted" };
+          }
+          throw new Error(`Unexpected Gateway method: ${request.method}`);
+        },
+      );
+      const tool = createSessionsSendTool({
+        agentSessionKey: sourceKey,
+        config,
+        callGateway,
+        agentChannel: "telegram",
+        requesterOrigin: {
+          channel: "telegram",
+          accountId: "original",
+          to: "original-peer",
+          threadId: "42",
+        },
+      });
+      try {
+        const result = await tool.execute("wake-peer", {
+          sessionKey: targetSessionKey,
+          message: "Complete the requested work",
+          mode: outcome === "error" ? "followup" : undefined,
+          timeoutSeconds: outcome === "reply" ? undefined : outcome === "error" ? 60 : 0,
+          wakeOnReply: true,
+        });
+        expect(result.details).toMatchObject({
+          status: "accepted",
+          delivery: { status: "pending" },
+        });
+        expect(continuations).toHaveLength(0);
+        await replaceSessionEntry(
+          { agentId: "main", sessionKey: sourceKey },
+          {
+            sessionId: "original-session",
+            updatedAt: 2,
+            lifecycleRevision: "original-generation",
+            delivery: normalizeSessionDeliveryState({
+              context: { channel: "telegram", accountId: "other", to: "later-peer" },
+            }),
+          },
+        );
+      } finally {
+        targetResult.resolve(
+          outcome === "error"
+            ? { status: "error", error: "Target failed".repeat(1000) }
+            : {
+                status: "ok",
+                terminalReply:
+                  outcome === "empty"
+                    ? { disposition: "empty" }
+                    : { disposition: "visible", text: "Requested result" },
+              },
+        );
+        await settled.promise;
+      }
+      if (outcome === "empty") {
+        expect(continuations).toHaveLength(0);
+      } else {
+        expect(continuations).toEqual([
+          expect.objectContaining({
+            sessionKey: sourceKey,
+            expectedExistingSessionId: "original-session",
+            expectedExistingSessionLifecycleRevision: "original-generation",
+            channel: "telegram",
+            accountId: "original",
+            to: "original-peer",
+            threadId: "42",
+            message: expect.stringContaining(
+              outcome === "error" ? "Target failed" : "Requested result",
+            ),
+            inputProvenance: expect.objectContaining({
+              kind: "inter_session",
+              sourceTool: "sessions_send",
+              sourceSessionKey: targetSessionKey,
+            }),
+          }),
+        ]);
+      }
+      expect(callGateway.mock.calls.filter(([request]) => request.method === "agent")).toHaveLength(
+        outcome === "empty" ? 1 : 2,
+      );
+      expect(callGateway.mock.calls.some(([request]) => request.method === "send")).toBe(false);
+      expect(agentCommandFromIngress).not.toHaveBeenCalled();
+      if (outcome === "error") expect(String(continuations[0]?.message).length).toBeLessThan(4096);
     },
   );
 
