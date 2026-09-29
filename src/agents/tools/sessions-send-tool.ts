@@ -3,16 +3,14 @@ import { isRequesterParentOfBackgroundAcpSession } from "@openclaw/acp-core/sess
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { readAcpSessionMetaForEntry } from "../../acp/runtime/session-meta-readonly.js";
+import { resolveSessionThreadInfo } from "../../channels/plugins/session-conversation.js";
 import { tryResolveLegacyCompatibilityAgentId } from "../../config/legacy.default-agent-owner.js";
 import type { SessionDeliveryGeneration } from "../../config/sessions/session-delivery-generation.types.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../../config/sessions/session-store-owner.js";
-import { parseSessionThreadInfo } from "../../config/sessions/thread-info.js";
 import type { AgentRouteBinding } from "../../config/types.agents.js";
 import { shouldResumeParentSubagent } from "../../gateway/session-subagent-resume.js";
 import { resolveGatewaySessionStoreTargetWithStore } from "../../gateway/session-utils-store-lookup.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import { withSystemEventOwner } from "../../infra/system-event-ownership.js";
-import { enqueueSystemEventEntry } from "../../infra/system-events.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import {
   logSessionOwnershipLookupFailure,
@@ -53,6 +51,7 @@ import {
 import { ToolInputError } from "../tool-input-error.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readToolStringParam } from "./common.js";
+import { wrapGatewayPersonalToolExecution } from "./gateway-caller-context.js";
 import { callAgentToolGatewayRequest } from "./in-process-gateway.js";
 import { runWithScopedSessionAccess } from "./scoped-session-access.js";
 import {
@@ -81,6 +80,8 @@ import {
   createConfiguredAgentMainSession,
   isConfiguredAgentMainSessionKey,
   resolveConfiguredAgentMainSessionKey,
+  notifySessionsSendSession,
+  trySessionsSendActiveRunDelivery,
 } from "./sessions-send-tool.delivery.js";
 import { SessionsSendToolSchema, SessionsSendOutputSchema } from "./sessions-send-tool.schema.js";
 import type { SessionsSendToolOptions } from "./sessions-send-tool.types.js";
@@ -109,7 +110,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
     parameters: SessionsSendToolSchema,
     outputSchema: SessionsSendOutputSchema,
     prepareArguments: normalizeSessionsSendArguments,
-    execute: async (_toolCallId, args) => {
+    execute: wrapGatewayPersonalToolExecution(async (_toolCallId, args) => {
       const promptedAt = Date.now();
       const { params, message, mode, wakeOnReply, timeoutSeconds } =
         parseSessionsSendArguments(args);
@@ -405,7 +406,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
         !parsedRequesterSessionKey.rest.startsWith("hook:") &&
         !requesterIsSubagent &&
         deriveSessionChatTypeFromKey(rawRequesterSessionKey) === "direct" &&
-        !parseSessionThreadInfo(rawRequesterSessionKey).threadId
+        !resolveSessionThreadInfo(rawRequesterSessionKey).threadId
       ) {
         const requesterRouteBindings = cfg.bindings?.filter(
           (binding): binding is AgentRouteBinding => binding.type !== "acp",
@@ -525,7 +526,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
           sessionKey: unresolvedDisplayKey,
         });
       }
-      if (parseSessionThreadInfo(resolvedKey).threadId) {
+      if (resolveSessionThreadInfo(resolvedKey).threadId) {
         return sendFailure(
           "error",
           "sessions_send cannot target a thread session for inter-agent coordination. Use the parent channel session key instead.",
@@ -631,9 +632,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
             targetSessionEntry,
             targetAcpMeta,
           );
-          // Watch registration follows successful dispatch: a failed send must not leave
-          // a hidden watch, and cron run-scoped sends can fall back to the durable parent
-          // session, which is the key that receives future state changes.
+          // Register watches only after successful dispatch, using any Cron fallback's actual target.
           const watchRequested = params.watch === true;
           const registerWatchIfRequested = (targetSessionKey: string) => {
             const watched =
@@ -665,27 +664,14 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
             ...(requesterIsSubagent ? { sourceRole: "subagent" as const } : {}),
           };
           if (mode === "notify") {
-            const event = enqueueSystemEventEntry(
-              annotateInterSessionPromptText(message, inputProvenance),
-              withSystemEventOwner(
-                { sessionKey: resolvedKey, contextKey: `session-notify:${idempotencyKey}` },
-                targetAgentId,
-              ),
-            );
-            if (!event?.id) {
-              return jsonResult({
-                runId,
-                status: "error",
-                sessionKey: displayKey,
-                error: "Notification was not queued.",
-              });
-            }
-            return jsonResult({
-              status: "queued",
-              sessionKey: displayKey,
-              notificationId: event.id,
-              durability: "process",
-              runStarted: false,
+            return await notifySessionsSendSession({
+              message,
+              inputProvenance,
+              sessionKey: resolvedKey,
+              targetAgentId,
+              idempotencyKey,
+              runId,
+              displayKey,
             });
           }
           const sendParams = {
@@ -742,10 +728,25 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
                 ? "one-way"
                 : "peer";
 
+          const ownChild = targetSessionEntry?.spawnedBy === effectiveRequesterKey;
+          const startParams: Parameters<typeof startSessionsSendFollowup>[1] = {
+            cfg,
+            callGateway: gatewayCall,
+            runId,
+            mode: wakeOnReply ? "followup" : mode,
+            sendParams,
+            sourceOrigin: sameSession ? requesterOrigin : undefined,
+            sessionKey: wakeOnReply || mode || ownChild ? resolvedKey : displayKey,
+            sessionStoreTarget: targetSession,
+            deliveryTimeoutMs: announceTimeoutMs,
+            allowActiveRunQueueDelivery: timeoutSeconds === 0,
+            expectedSessionId,
+          };
+          const activeDelivery = await trySessionsSendActiveRunDelivery(startParams, ownChild);
           const followup =
+            !("ok" in activeDelivery) &&
             replyMode === "one-way" &&
-            mode !== "steer" &&
-            targetSessionEntry?.spawnedBy === effectiveRequesterKey &&
+            ownChild &&
             // Key-only DM rerouting keeps its run-scoped contract, not new authority for another key.
             replyRequesterSessionKey === effectiveRequesterKey &&
             replyRequesterSessionKey
@@ -776,41 +777,21 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
             requesterOrigin,
             requesterChannel,
           };
-          const { start, completion } = await startSessionsSendFollowup(
-            followup,
-            {
-              cfg,
-              callGateway: gatewayCall,
-              runId,
-              mode: wakeOnReply ? "followup" : mode,
-              sendParams,
-              sourceOrigin: sameSession ? requesterOrigin : undefined,
-              sessionKey: mode ? resolvedKey : displayKey,
-              sessionStoreTarget: targetSession,
-              deliveryTimeoutMs: announceTimeoutMs,
-              ...(timeoutSeconds === 0
-                ? {
-                    allowActiveRunQueueDelivery: true,
-                    // An exact-incarnation grant authorizes only this target. Never
-                    // reroute a worker-owned send to a durable Cron parent outside
-                    // the scoped lifecycle admission or replace its stable key.
-                    allowActiveRunQueueFallback: !expectedSessionId,
-                    expectedSessionId,
-                  }
-                : {}),
-            },
-            replyContext,
-          );
+          const { start, completion } =
+            "ok" in activeDelivery
+              ? { start: activeDelivery, completion: undefined }
+              : await startSessionsSendFollowup(
+                  followup,
+                  { ...startParams, ...activeDelivery },
+                  replyContext,
+                );
           if (!start.ok) {
             return start.result;
           }
           const acceptedTargetSessionKey = start.a2aSessionKey ?? resolvedKey;
           // Steering keeps its active owner; an inline child reply is already delivered.
           const delayedDelivery = {
-            status:
-              replyMode !== undefined && start.targetDisposition === "queued"
-                ? "pending"
-                : "skipped",
+            status: replyMode && start.targetDisposition === "queued" ? "pending" : "skipped",
             mode: "announce",
           } as const;
           const delivery =
@@ -937,7 +918,7 @@ export function createSessionsSendTool(opts?: SessionsSendToolOptions): AnyAgent
           return jsonResult({ runId, sessionKey: displayKey, ...response, ...watchField });
         },
       });
-    },
+    }),
   };
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

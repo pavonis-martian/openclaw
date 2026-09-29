@@ -347,9 +347,12 @@ describe("sessions_send dispatch admission", () => {
       const callGateway = vi.fn();
       callGateway.mockImplementation(
         async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-          if (request.method === "sessions.resolve") return { key: targetKey, agentId: "main" };
-          if (request.method === "sessions.list")
+          if (request.method === "sessions.resolve") {
+            return { key: targetKey, agentId: "main" };
+          }
+          if (request.method === "sessions.list") {
             return { sessions: [{ key: targetKey, agentId: "main", kind: "direct" }] };
+          }
           throw new Error(`Unexpected Gateway method: ${request.method}`);
         },
       );
@@ -493,7 +496,9 @@ describe("sessions_send dispatch admission", () => {
       );
       expect(callGateway.mock.calls.some(([request]) => request.method === "send")).toBe(false);
       expect(agentCommandFromIngress).not.toHaveBeenCalled();
-      if (outcome === "error") expect(String(continuations[0]?.message).length).toBeLessThan(4096);
+      if (outcome === "error") {
+        expect(String(continuations[0]?.message).length).toBeLessThan(4096);
+      }
     },
   );
 
